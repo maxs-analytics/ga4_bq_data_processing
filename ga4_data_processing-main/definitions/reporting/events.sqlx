@@ -1,0 +1,51 @@
+config {
+  schema: `${constants.GA4_PROCESSED_DATA_DATASCHEMA}`,
+  type: "incremental",
+  bigquery: {
+    partitionBy: 'date',
+    clusterBy:['event_name']
+  },
+  tags: ['events', 'base', 'ecommerce'],
+}
+
+pre_operations {
+    ${ when(incremental(), `DELETE FROM ${self()} WHERE date >= DATE_SUB(CURRENT_DATE('${constants.TIME_ZONE}'), INTERVAL ${constants.REFRESH_LOOKBACK_WINDOW} DAY);`)}
+}
+
+SELECT
+  ${helpers.getDate()},
+  ${helpers.getEventDatetime()},
+  TIMESTAMP_MICROS(event_timestamp) event_timestamp_utc,
+  FARM_FINGERPRINT(
+  CONCAT(
+    s.session_id,
+    event_timestamp,
+    event_name
+  )) event_id,
+  event_name,
+  ${when(constants.EVENT_PARAMS.length,
+  helpers.getEventParams(constants.EVENT_PARAMS) + ',')}
+  COALESCE(
+    CAST(${helpers.getEventParam('value', 'int', false)} AS FLOAT64),
+    CAST(${helpers.getEventParam('value', 'float', false)} AS FLOAT64),
+    CAST(${helpers.getEventParam('value', 'double', false)} AS FLOAT64)
+  ) AS value,
+  ${helpers.getEventParam('currency', 'string', true)},
+  ${helpers.getEventParam('page_location', 'string', true)},
+  SPLIT(${helpers.getEventParam('page_location', 'string', false)}, "?")[SAFE_OFFSET(0)] page_location_without_query_string,
+  e.ecommerce,
+  s.* EXCEPT(date),
+  ROW_NUMBER() OVER (PARTITION BY s.session_id, event_name ORDER BY TIMESTAMP_MICROS(event_timestamp) ASC) event_seq_num,
+  ROW_NUMBER() OVER (PARTITION BY s.session_id, event_name ORDER BY TIMESTAMP_MICROS(event_timestamp) DESC) event_seq_num_reverted
+FROM
+  `${dataform.projectConfig.defaultDatabase}.${constants.GA4_DATASCHEMA}.${constants.GA4_TABLE_PREFIX || "events_*"}` AS e
+LEFT JOIN
+  ${ref('sessions')} AS s ON ${helpers.getSessionId(false, "e")} = s.session_id
+  AND PARSE_DATE('%Y%m%d', e.event_date) = s.date
+WHERE
+  ${ when(incremental(),
+  `_TABLE_SUFFIX >= FORMAT_DATE("%Y%m%d", DATE_SUB(CURRENT_DATE('${constants.TIME_ZONE}'), INTERVAL ${constants.REFRESH_LOOKBACK_WINDOW} DAY)) AND`,
+  when(constants.START_DATE, `_TABLE_SUFFIX >= FORMAT_DATE("%Y%m%d", DATE ${constants.START_DATE}) AND`)
+  )}
+  _TABLE_SUFFIX NOT LIKE "intraday%"
+
